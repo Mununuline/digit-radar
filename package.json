@@ -1,0 +1,8 @@
+{
+  "name": "digit-radar",
+  "version": "1.0.0",
+  "description": "Deriv digit statistics dashboard with an AI risk analyst",
+  "private": true,
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" }
+}
