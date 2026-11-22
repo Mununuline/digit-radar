@@ -14,6 +14,7 @@
   .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; margin-bottom:14px; }
   button { background:#3b82f6; color:#fff; border:0; border-radius:8px; padding:10px 16px; font-size:15px; cursor:pointer; }
   button:disabled { background:#334; cursor:not-allowed; }
+  select { background:var(--bg); color:var(--ink); border:1px solid var(--line); border-radius:8px; padding:9px 10px; font-size:15px; margin-right:10px; }
   .verdict { font-size:18px; font-weight:600; }
   .ok { color:var(--ok); } .warn { color:var(--warn); } .bad { color:var(--bad); } .mute { color:var(--mute); }
   table { width:100%; border-collapse:collapse; font-size:14px; }
@@ -30,8 +31,16 @@
   <p class="sub">Scans all 10 volatility indices in one pass and reports a signal only when it survives a multiple-comparison correction and an out-of-sample check.</p>
 
   <div class="card">
+    <label for="type" class="small" style="display:block;margin-bottom:6px">Contract type to scan</label>
+    <select id="type">
+      <option value="all">All contract types</option>
+      <option value="match">Matches only</option>
+      <option value="differs">Differs only</option>
+      <option value="evenodd">Even / Odd only</option>
+      <option value="overunder">Over / Under only</option>
+    </select>
     <button id="scanBtn">Scan all markets</button>
-    <span id="status" class="small" style="margin-left:10px"></span>
+    <div id="status" class="small" style="margin-top:10px"></div>
   </div>
 
   <div class="card" id="verdictCard">
@@ -41,16 +50,17 @@
 
   <div class="card wrap">
     <table>
-      <thead><tr><th>Market</th><th>Best digit bet</th><th>Select z</th><th>Holdout z</th><th>Holdout win rate</th><th>Fair rate</th><th>Result</th></tr></thead>
+      <thead><tr><th>Market</th><th>Best bet</th><th>Select z</th><th>Holdout z</th><th>Holdout win rate</th><th>Fair rate</th><th>Result</th></tr></thead>
       <tbody id="rows"><tr><td colspan="7" class="mute">No data yet.</td></tr></tbody>
     </table>
   </div>
 
   <div class="card note small">
     <strong>How to read this.</strong> Digits on these indices are generated randomly. A signal here means a
-    bet looked better than chance in the sample, after correcting for testing 20 bets across 10 markets.
+    bet looked better than chance in the sample, after correcting for the number of bets tested.
     Under pure randomness, a false signal appears in roughly 0.2% of scans. Even a real pattern can stop
     working without warning. Nothing on this page predicts a result, and it does not guarantee a win.
+    Deriv pays less than fair odds on these contracts, so random digits lose money over time.
     Use the demo account and risk only money you can afford to lose.
   </div>
 </main>
@@ -68,6 +78,14 @@ const FEEDS = [
   "wss://api.derivws.com/trading/v1/options/ws/public",
   "wss://ws.derivws.com/websockets/v3?app_id=1089"
 ];
+// Contract families. Each one scans only its own candidates.
+const FAMILIES = {
+  all: ["M", "D", "O", "U", "E", "A"],
+  match: ["M"],
+  differs: ["D"],
+  evenodd: ["E", "A"],
+  overunder: ["O", "U"]
+};
 const SEL_Z = 3.7;   // selection threshold: about 0.0001 per test across the 20 candidates
 const VAL_Z = 1.65;  // holdout must also clear one-sided 5%
 const COUNT = 1000;  // ticks per market
@@ -97,22 +115,23 @@ function fair(t, d) {
 function label(t, d) {
   return { M:"Match "+d, D:"Differs "+d, O:"Over "+d, U:"Under "+d, E:"Even", A:"Odd" }[t];
 }
-function candidates() {
+function candidates(types) {
   const c = [];
-  for (let d = 0; d <= 9; d++) c.push(["M", d], ["D", d]);
-  for (let b = 0; b <= 8; b++) c.push(["O", b]);
-  for (let b = 1; b <= 9; b++) c.push(["U", b]);
-  c.push(["E", 0], ["A", 0]);
+  if (types.includes("M")) for (let d = 0; d <= 9; d++) c.push(["M", d]);
+  if (types.includes("D")) for (let d = 0; d <= 9; d++) c.push(["D", d]);
+  if (types.includes("O")) for (let b = 0; b <= 8; b++) c.push(["O", b]);
+  if (types.includes("U")) for (let b = 1; b <= 9; b++) c.push(["U", b]);
+  if (types.includes("E")) c.push(["E", 0]);
+  if (types.includes("A")) c.push(["A", 0]);
   return c;
 }
-const CANDS = candidates();
 function z(h, n, p) { return (h - n * p) / Math.sqrt(n * p * (1 - p)); }
 
 // Select on the first 60% of digits, validate on the untouched last 40%.
-function analyse(D) {
+function analyse(D, types) {
   const n = D.length, cut = Math.floor(n * 0.6), nv = n - cut;
   let best = null;
-  for (const [t, d] of CANDS) {
+  for (const [t, d] of candidates(types)) {
     let h = 0;
     for (let i = 0; i < cut; i++) if (wins(t, d, D[i])) h++;
     const zs = z(h, cut, fair(t, d));
@@ -165,23 +184,26 @@ async function fetchTicks(symbol, pip) {
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s).replace(/[&<>"]/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
 const pct = (x) => (x * 100).toFixed(1) + "%";
+const TYPE_NAMES = { all: "all contract types", match: "Matches", differs: "Differs", evenodd: "Even / Odd", overunder: "Over / Under" };
 
 async function scan() {
   const btn = $("scanBtn");
+  const family = $("type").value;
+  const types = FAMILIES[family] || FAMILIES.all;
   btn.disabled = true;
   $("status").textContent = "Fetching ticks…";
   const results = [];
   for (const [sym, pip] of MARKETS) {
     try {
       const digits = await fetchTicks(sym, pip);
-      results.push({ sym, ...analyse(digits) });
+      results.push({ sym, ...analyse(digits, types) });
     } catch (e) {
       results.push({ sym, error: e.message });
     }
     renderRows(results);
   }
-  $("status").textContent = "Scan finished at " + new Date().toLocaleTimeString();
-  renderVerdict(results);
+  $("status").textContent = "Scan finished at " + new Date().toLocaleTimeString() + " (" + TYPE_NAMES[family] + ")";
+  renderVerdict(results, family);
   btn.disabled = false;
 }
 
@@ -193,7 +215,7 @@ function renderRows(results) {
   }).join("");
 }
 
-function renderVerdict(results) {
+function renderVerdict(results, family) {
   const ok = results.filter(r => !r.error);
   const signals = ok.filter(r => r.pass).sort((a, b) => b.zVal - a.zVal);
   if (ok.length === 0) {
@@ -205,7 +227,7 @@ function renderVerdict(results) {
   if (signals.length === 0) {
     $("verdict").className = "verdict warn";
     $("verdict").textContent = "No edge shown. Do not trade on this scan.";
-    $("detail").textContent = `Checked ${ok.length} markets. None passed both the selection and holdout tests. This is the expected result for random digits.`;
+    $("detail").textContent = `Checked ${ok.length} markets for ${TYPE_NAMES[family]}. None passed both the selection and holdout tests. This is the expected result for random digits.`;
     return;
   }
   const top = signals[0];
