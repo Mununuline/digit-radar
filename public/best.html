@@ -57,13 +57,23 @@
 
 <script>
 "use strict";
-// ---- Statistics -------------------------------------------------------------
-// Contract candidates: Match d, Differ d, Over b, Under b, Even, Odd.
-const SYMBOLS = ["R_10","R_25","R_50","R_75","R_100","1HZ10V","1HZ25V","1HZ50V","1HZ75V","1HZ100V"];
+// ---- Markets ----------------------------------------------------------------
+// [symbol, price decimal places] - same precision the main dashboard uses.
+const MARKETS = [
+  ["R_10", 3], ["R_25", 3], ["R_50", 4], ["R_75", 4], ["R_100", 2],
+  ["1HZ10V", 2], ["1HZ25V", 2], ["1HZ50V", 2], ["1HZ75V", 2], ["1HZ100V", 2]
+];
+// Same feeds, same order, as the main dashboard. The first one that answers is used.
+const FEEDS = [
+  "wss://api.derivws.com/trading/v1/options/ws/public",
+  "wss://ws.derivws.com/websockets/v3?app_id=1089"
+];
 const SEL_Z = 3.7;   // selection threshold: about 0.0001 per test across the 20 candidates
 const VAL_Z = 1.65;  // holdout must also clear one-sided 5%
 const COUNT = 1000;  // ticks per market
 
+// ---- Statistics -------------------------------------------------------------
+// Contract candidates: Match d, Differ d, Over b, Under b, Even, Odd.
 function wins(t, d, x) {
   switch (t) {
     case "M": return x === d;
@@ -119,27 +129,36 @@ function analyse(D) {
 }
 
 // ---- Data -------------------------------------------------------------------
-// Public Deriv websocket, no login needed for tick history.
-const WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089";
-
-function fetchTicks(symbol) {
+// Ask one feed for tick history. Resolves with the last digit of each tick.
+function requestTicks(url, symbol, pip) {
   return new Promise((resolve, reject) => {
-    let ws;
-    try { ws = new WebSocket(WS_URL); } catch (e) { reject(e); return; }
-    const timer = setTimeout(() => { try { ws.close(); } catch (_) {} reject(new Error("timeout")); }, 15000);
-    ws.onopen = () => ws.send(JSON.stringify({ ticks_history: symbol, end: "latest", count: COUNT, style: "ticks", req_id: 1 }));
+    let ws, done = false;
+    const finish = (fn, v) => { if (done) return; done = true; clearTimeout(timer); try { ws.close(); } catch (_) {} fn(v); };
+    const timer = setTimeout(() => finish(reject, new Error("no reply")), 8000);
+    try { ws = new WebSocket(url); } catch (e) { finish(reject, e); return; }
+    ws.onopen = () => ws.send(JSON.stringify({ ticks_history: symbol, count: COUNT, end: "latest", style: "ticks", req_id: 1 }));
     ws.onmessage = (ev) => {
-      const msg = JSON.parse(ev.data);
-      if (msg.error) { clearTimeout(timer); ws.close(); reject(new Error(msg.error.message)); return; }
-      if (msg.msg_type === "history") {
-        clearTimeout(timer); ws.close();
-        const pip = msg.pip_size || 2;
-        const digits = msg.history.prices.map(p => Math.round(p * Math.pow(10, pip)) % 10);
-        resolve(digits);
+      let m; try { m = JSON.parse(ev.data); } catch (_) { return; }
+      if (m.error) { finish(reject, new Error(m.error.message || m.error.code || "Deriv error")); return; }
+      const hist = m.history || (m.data && m.data.history);
+      if (hist && hist.prices) {
+        const p = typeof m.pip_size === "number" ? m.pip_size : pip;
+        finish(resolve, hist.prices.map(x => { const s = Number(x).toFixed(p); return +s.charAt(s.length - 1); }));
       }
     };
-    ws.onerror = () => { clearTimeout(timer); reject(new Error("connection failed")); };
+    ws.onerror = () => finish(reject, new Error("connection failed"));
+    ws.onclose = () => finish(reject, new Error("connection closed"));
   });
+}
+
+// Try each feed in turn until one returns ticks.
+async function fetchTicks(symbol, pip) {
+  let lastErr = null;
+  for (const url of FEEDS) {
+    try { return await requestTicks(url, symbol, pip); }
+    catch (e) { lastErr = e; }
+  }
+  throw lastErr || new Error("no feed answered");
 }
 
 // ---- UI ---------------------------------------------------------------------
@@ -152,9 +171,9 @@ async function scan() {
   btn.disabled = true;
   $("status").textContent = "Fetching ticks…";
   const results = [];
-  for (const sym of SYMBOLS) {
+  for (const [sym, pip] of MARKETS) {
     try {
-      const digits = await fetchTicks(sym);
+      const digits = await fetchTicks(sym, pip);
       results.push({ sym, ...analyse(digits) });
     } catch (e) {
       results.push({ sym, error: e.message });
@@ -180,7 +199,7 @@ function renderVerdict(results) {
   if (ok.length === 0) {
     $("verdict").className = "verdict bad";
     $("verdict").textContent = "No market data could be loaded.";
-    $("detail").textContent = "Check your connection and try again.";
+    $("detail").textContent = "Deriv did not answer from either feed. Check your connection, or try the main dashboard first to confirm the feed is up.";
     return;
   }
   if (signals.length === 0) {
