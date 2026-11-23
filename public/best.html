@@ -25,6 +25,10 @@
   /* Best pick panel. Green only when the pick passed both tests. */
   .pickbox { display:flex; gap:16px; align-items:center; border:2px solid var(--line); border-radius:12px; padding:14px; background:var(--card); }
   .pickbox.signal { border-color:var(--ok); background:#0f2a22; }
+  /* Right after a scan: orange for 15 seconds, then back to the normal colour. */
+  .pickbox.fresh { border-color:#f5a64a; background:#3a2a12; }
+  .pickbox.fresh .digit { background:#f5a64a; color:#2a1a06; }
+  .pickbox.fresh .pick-text { color:#f5a64a; }
   .digit { font-size:64px; font-weight:800; line-height:1; min-width:96px; text-align:center; padding:10px 0; border-radius:10px; background:var(--bg); color:var(--mute); font-variant-numeric:tabular-nums; }
   .pickbox.signal .digit { background:var(--ok); color:#06261b; }
   .pick-text { font-size:18px; font-weight:600; }
@@ -229,8 +233,18 @@ async function scan() {
   scannedAt = Date.now();
   $("status").textContent = "Scan finished at " + new Date(scannedAt).toLocaleTimeString() + " (" + TYPE_NAMES[family] + ")";
   renderPick(results, family);
+  flashFresh();
   tickAge();
   btn.disabled = false;
+}
+
+// Orange for 15 seconds after each scan, then the panel returns to its normal colour.
+let freshTimer = null;
+function flashFresh() {
+  const box = $("pickbox");
+  box.classList.add("fresh");
+  clearTimeout(freshTimer);
+  freshTimer = setTimeout(() => box.classList.remove("fresh"), 15000);
 }
 
 // Shows how long ago the last scan finished. It does not mark any time as "good to trade".
