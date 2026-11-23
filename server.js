@@ -1,6 +1,6 @@
 'use strict';
 // Digit Radar server. No dependencies.
-// - Serves the page.
+// - Serves the page, behind a 6-digit PAGE_PIN when one is set.
 // - Proxies analyst questions to the Anthropic API (the API key never reaches the browser).
 // - Hands the browser a one-time Deriv trading WebSocket URL. The Deriv token never leaves this server.
 const http = require('http');
@@ -20,6 +20,7 @@ const PORT = Number(env.PORT) || 3000;
 const KEY = env.ANTHROPIC_API_KEY || '';
 const MODEL = env.ANTHROPIC_MODEL || 'claude-sonnet-5-5';
 const PASS = env.APP_PASSWORD || '';
+const PAGE_PIN = env.PAGE_PIN || '';
 const PUBLIC = path.join(__dirname, 'public');
 
 const D = {
@@ -84,9 +85,16 @@ function limited(name, ip, max, windowMs) {
   list.push(now); buckets.set(key, list);
   return list.length > max;
 }
-setInterval(function () { buckets.clear(); fails.clear(); }, 15 * 60 * 1000).unref();
-
 const fails = new Map();
+const pinFails = new Map();
+const sessions = new Map(); // session token -> expiry time
+const SESSION_MS = 12 * 60 * 60 * 1000;
+setInterval(function () {
+  buckets.clear(); fails.clear(); pinFails.clear();
+  const now = Date.now();
+  for (const [t, exp] of sessions) if (exp < now) sessions.delete(t);
+}, 15 * 60 * 1000).unref();
+
 function passOk(req) {
   const a = crypto.createHash('sha256').update(String(req.headers['x-app-password'] || '')).digest();
   const b = crypto.createHash('sha256').update(PASS).digest();
@@ -103,6 +111,52 @@ function checkAuth(req, res) {
   send(res, 401, { error: 'Wrong or missing access password.' });
   return false;
 }
+
+// ---- page PIN ----
+function validSession(req) {
+  const m = /(?:^|;\s*)dr_session=([0-9a-f]{64})/.exec(req.headers.cookie || '');
+  if (!m) return false;
+  const exp = sessions.get(m[1]);
+  if (!exp || exp < Date.now()) { sessions.delete(m[1]); return false; }
+  return true;
+}
+function pinMatches(input) {
+  const a = crypto.createHash('sha256').update(String(input)).digest();
+  const b = crypto.createHash('sha256').update(PAGE_PIN).digest();
+  return crypto.timingSafeEqual(a, b);
+}
+async function pinLogin(req, res) {
+  const ip = clientIp(req), now = Date.now();
+  const list = (pinFails.get(ip) || []).filter(function (t) { return now - t < 600000; });
+  if (list.length >= 5) return send(res, 429, { error: 'Too many wrong PINs. Wait ten minutes.' });
+  let data;
+  try { data = JSON.parse(await readBody(req, 200)); } catch (e) { return send(res, 400, { error: 'Bad request.' }); }
+  const pin = data && typeof data.pin === 'string' ? data.pin : '';
+  if (!/^\d{6}$/.test(pin) || !pinMatches(pin)) {
+    list.push(now); pinFails.set(ip, list);
+    return send(res, 401, { error: 'Wrong PIN.' });
+  }
+  const token = crypto.randomBytes(32).toString('hex');
+  sessions.set(token, Date.now() + SESSION_MS);
+  res.writeHead(200, {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+    'set-cookie': 'dr_session=' + token + '; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=' + Math.floor(SESSION_MS / 1000)
+  });
+  res.end(JSON.stringify({ ok: true }));
+}
+const LOGIN_PAGE = '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">' +
+  '<title>Digit Radar</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0f1420;color:#e7ecf5;font:16px system-ui,sans-serif}' +
+  'form{display:flex;flex-direction:column;gap:12px;width:min(92vw,300px);text-align:center}h1{font-size:22px;margin:0 0 6px}' +
+  'input{font:28px monospace;letter-spacing:.4em;text-align:center;padding:12px;border-radius:10px;border:1px solid #2a3548;background:#171f2e;color:#e7ecf5}' +
+  'button{padding:12px;border:0;border-radius:10px;background:#3b82f6;color:#fff;font-size:16px;font-weight:600}' +
+  'p{margin:0;min-height:20px;color:#ef6461;font-size:14px}</style></head><body>' +
+  '<form id="f"><h1>Digit Radar</h1><input id="pin" inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="[0-9]{6}" placeholder="------" required>' +
+  '<button type="submit">Unlock</button><p id="msg"></p></form>' +
+  '<script>document.getElementById("f").addEventListener("submit",function(e){e.preventDefault();var v=document.getElementById("pin").value;' +
+  'fetch("/api/login",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({pin:v})}).then(function(r){return r.json().then(function(b){return{ok:r.ok,b:b};});})' +
+  '.then(function(x){if(x.ok){location.href="/";}else{document.getElementById("msg").textContent=(x.b&&x.b.error)||"Could not unlock.";}})' +
+  '.catch(function(){document.getElementById("msg").textContent="Could not reach the server.";});});</script></body></html>';
 
 // ---- analyst ----
 async function analyze(req, res) {
@@ -212,11 +266,22 @@ const CSP = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 's
 
 function handler(req, res) {
   const url = (req.url || '/').split('?')[0];
+  if (url === '/api/health') return send(res, 200, { ok: true });
+  if (url === '/api/login') return req.method === 'POST' ? pinLogin(req, res) : send(res, 405, { error: 'Use POST.' });
+  if (url === '/login') {
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'content-security-policy': CSP, 'x-frame-options': 'DENY' });
+    return res.end(LOGIN_PAGE);
+  }
+  // With a page PIN set, every other page and API call needs a valid session first.
+  if (PAGE_PIN && !validSession(req)) {
+    if (url.indexOf('/api/') === 0) return send(res, 401, { error: 'Enter the dashboard PIN first.' });
+    res.writeHead(302, { location: '/login', 'cache-control': 'no-store' });
+    return res.end();
+  }
   if (url === '/api/analyze') return req.method === 'POST' ? analyze(req, res) : send(res, 405, { error: 'Use POST.' });
   if (url === '/api/deriv/otp') return req.method === 'POST' ? derivOtp(req, res) : send(res, 405, { error: 'Use POST.' });
   if (url === '/api/deriv/accounts') return req.method === 'GET' ? derivAccounts(req, res) : send(res, 405, { error: 'Use GET.' });
   if (url === '/api/config') return send(res, 200, { analyst: !!KEY, passwordRequired: !!PASS, trading: tradingStatus() });
-  if (url === '/api/health') return send(res, 200, { ok: true });
   if (req.method !== 'GET' && req.method !== 'HEAD') { res.writeHead(405); return res.end(); }
   const rel = url === '/' ? 'index.html' : url.replace(/^\/+/, '');
   const file = path.normalize(path.join(PUBLIC, rel));
@@ -243,5 +308,6 @@ if (require.main === module) http.createServer(handler).listen(PORT, function ()
   console.log('Digit Radar running at http://localhost:' + PORT);
   console.log(KEY ? 'Analyst: on (' + MODEL + ')' : 'Analyst: off, add ANTHROPIC_API_KEY');
   console.log(t.configured ? 'Trading: demo ' + (t.demo ? 'on' : 'off') + ', real ' + (t.real ? 'ON' : 'off') + ', max stake ' + t.maxStake : 'Trading: off. ' + t.reason);
+  console.log(PAGE_PIN ? 'Page PIN: on' : 'Page PIN: off, set PAGE_PIN (6 digits) to lock the dashboard');
   if (!PASS) console.log('Warning: no APP_PASSWORD set. Set one before putting this site online.');
 });
