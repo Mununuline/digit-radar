@@ -15,7 +15,7 @@
   button { background:#3b82f6; color:#fff; border:0; border-radius:8px; padding:10px 16px; font-size:15px; cursor:pointer; }
   button:disabled { background:#334; cursor:not-allowed; }
   select { background:var(--bg); color:var(--ink); border:1px solid var(--line); border-radius:8px; padding:9px 10px; font-size:15px; margin-right:10px; }
-  .verdict { font-size:18px; font-weight:600; }
+  .pick { font-size:20px; font-weight:600; margin:2px 0 6px; }
   .ok { color:var(--ok); } .warn { color:var(--warn); } .bad { color:var(--bad); } .mute { color:var(--mute); }
   table { width:100%; border-collapse:collapse; font-size:14px; }
   th, td { text-align:left; padding:8px 6px; border-bottom:1px solid var(--line); }
@@ -28,7 +28,7 @@
 <body>
 <main>
   <h1>Best Market & Digit Scanner</h1>
-  <p class="sub">Scans all 10 volatility indices in one pass and reports a signal only when it survives a multiple-comparison correction and an out-of-sample check.</p>
+  <p class="sub">Scans all 10 volatility indices in one pass and picks one market and one digit. It is marked as a signal only when it survives a multiple-comparison correction and an out-of-sample check.</p>
 
   <div class="card">
     <label for="type" class="small" style="display:block;margin-bottom:6px">Contract type to scan</label>
@@ -44,13 +44,15 @@
   </div>
 
   <div class="card" id="verdictCard">
-    <div id="verdict" class="verdict mute">Press "Scan all markets" to start.</div>
+    <div class="small">Best pick</div>
+    <div id="pick" class="pick mute">Press "Scan all markets" to start.</div>
+    <div id="verdict" class="verdict mute"></div>
     <div id="detail" class="small" style="margin-top:6px"></div>
   </div>
 
   <div class="card wrap">
     <table>
-      <thead><tr><th>Market</th><th>Best bet</th><th>Select z</th><th>Holdout z</th><th>Holdout win rate</th><th>Fair rate</th><th>Result</th></tr></thead>
+      <thead><tr><th>Market</th><th>Best digit bet</th><th>Select z</th><th>Holdout z</th><th>Holdout win rate</th><th>Fair rate</th><th>Result</th></tr></thead>
       <tbody id="rows"><tr><td colspan="7" class="mute">No data yet.</td></tr></tbody>
     </table>
   </div>
@@ -73,6 +75,13 @@ const MARKETS = [
   ["R_10", 3], ["R_25", 3], ["R_50", 4], ["R_75", 4], ["R_100", 2],
   ["1HZ10V", 2], ["1HZ25V", 2], ["1HZ50V", 2], ["1HZ75V", 2], ["1HZ100V", 2]
 ];
+// Names as shown on the page. The 1-second indices are marked (1s).
+const NAMES = {
+  "R_10": "Volatility 10", "R_25": "Volatility 25", "R_50": "Volatility 50",
+  "R_75": "Volatility 75", "R_100": "Volatility 100",
+  "1HZ10V": "Volatility 10 (1s)", "1HZ25V": "Volatility 25 (1s)", "1HZ50V": "Volatility 50 (1s)",
+  "1HZ75V": "Volatility 75 (1s)", "1HZ100V": "Volatility 100 (1s)"
+};
 // Same feeds, same order, as the main dashboard. The first one that answers is used.
 const FEEDS = [
   "wss://api.derivws.com/trading/v1/options/ws/public",
@@ -203,37 +212,42 @@ async function scan() {
     renderRows(results);
   }
   $("status").textContent = "Scan finished at " + new Date().toLocaleTimeString() + " (" + TYPE_NAMES[family] + ")";
-  renderVerdict(results, family);
+  renderPick(results, family);
   btn.disabled = false;
 }
 
 function renderRows(results) {
   $("rows").innerHTML = results.map(r => {
-    if (r.error) return `<tr><td>${esc(r.sym)}</td><td colspan="6" class="bad">${esc(r.error)}</td></tr>`;
+    const name = esc(NAMES[r.sym] || r.sym);
+    if (r.error) return `<tr><td>${name}</td><td colspan="6" class="bad">${esc(r.error)}</td></tr>`;
     const res = r.pass ? '<span class="ok">Signal</span>' : '<span class="mute">No edge</span>';
-    return `<tr><td>${esc(r.sym)}</td><td>${esc(r.label)}</td><td>${r.zSel.toFixed(2)}</td><td>${r.zVal.toFixed(2)}</td><td>${pct(r.winRate)}</td><td>${pct(r.fairRate)}</td><td>${res}</td></tr>`;
+    return `<tr><td>${name}</td><td>${esc(r.label)}</td><td>${r.zSel.toFixed(2)}</td><td>${r.zVal.toFixed(2)}</td><td>${pct(r.winRate)}</td><td>${pct(r.fairRate)}</td><td>${res}</td></tr>`;
   }).join("");
 }
 
-function renderVerdict(results, family) {
+// One pick: the market and digit with the strongest holdout result, whether or not it passes.
+function renderPick(results, family) {
   const ok = results.filter(r => !r.error);
-  const signals = ok.filter(r => r.pass).sort((a, b) => b.zVal - a.zVal);
   if (ok.length === 0) {
-    $("verdict").className = "verdict bad";
-    $("verdict").textContent = "No market data could be loaded.";
+    $("pick").className = "pick bad";
+    $("pick").textContent = "No market data could be loaded.";
+    $("verdict").textContent = "";
     $("detail").textContent = "Deriv did not answer from either feed. Check your connection, or try the main dashboard first to confirm the feed is up.";
     return;
   }
-  if (signals.length === 0) {
+  const top = ok.slice().sort((a, b) => b.zVal - a.zVal)[0];
+  const name = NAMES[top.sym] || top.sym;
+  $("pick").className = "pick";
+  $("pick").textContent = `${name}: ${top.label}`;
+  if (top.pass) {
+    $("verdict").className = "verdict ok";
+    $("verdict").textContent = "Signal: passed both tests.";
+    $("detail").textContent = `Holdout win rate ${pct(top.winRate)} against a fair rate of ${pct(top.fairRate)} (holdout z = ${top.zVal.toFixed(2)}). Treat this as a statistical observation, not a prediction.`;
+  } else {
     $("verdict").className = "verdict warn";
-    $("verdict").textContent = "No edge shown. Do not trade on this scan.";
-    $("detail").textContent = `Checked ${ok.length} markets for ${TYPE_NAMES[family]}. None passed both the selection and holdout tests. This is the expected result for random digits.`;
-    return;
+    $("verdict").textContent = "No edge shown. Do not trade on this pick.";
+    $("detail").textContent = `This is the strongest of ${ok.length} markets for ${TYPE_NAMES[family]}, and it did not pass both tests (holdout z = ${top.zVal.toFixed(2)}). With random digits, one market always looks best by chance.`;
   }
-  const top = signals[0];
-  $("verdict").className = "verdict ok";
-  $("verdict").textContent = `Best candidate: ${top.sym}, ${top.label}`;
-  $("detail").textContent = `Holdout win rate ${pct(top.winRate)} against a fair rate of ${pct(top.fairRate)} (holdout z = ${top.zVal.toFixed(2)}). ${signals.length} of ${ok.length} markets passed. Treat this as a statistical observation, not a prediction.`;
 }
 
 $("scanBtn").addEventListener("click", scan);
