@@ -10,11 +10,15 @@
   body { margin:0; font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--ink); }
   main { max-width:860px; margin:0 auto; padding:16px; }
   h1 { font-size:22px; margin:8px 0 4px; }
+  h2 { font-size:17px; margin:0 0 6px; }
   .sub { color:var(--mute); margin:0 0 16px; }
   .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; margin-bottom:14px; }
   button { background:#3b82f6; color:#fff; border:0; border-radius:8px; padding:10px 16px; font-size:15px; cursor:pointer; }
   button:disabled { background:#334; cursor:not-allowed; }
-  select { background:var(--bg); color:var(--ink); border:1px solid var(--line); border-radius:8px; padding:9px 10px; font-size:15px; margin-right:10px; }
+  button.alt { background:transparent; border:1px solid var(--line); color:var(--ink); }
+  select, input { background:var(--bg); color:var(--ink); border:1px solid var(--line); border-radius:8px; padding:9px 10px; font-size:15px; }
+  .row { display:flex; flex-wrap:wrap; gap:10px; align-items:flex-end; margin-bottom:10px; }
+  .row label { display:flex; flex-direction:column; gap:4px; font-size:12px; color:var(--mute); }
   .ok { color:var(--ok); } .warn { color:var(--warn); } .bad { color:var(--bad); } .mute { color:var(--mute); }
   table { width:100%; border-collapse:collapse; font-size:14px; }
   th, td { text-align:left; padding:8px 6px; border-bottom:1px solid var(--line); }
@@ -22,6 +26,9 @@
   .small { font-size:13px; color:var(--mute); }
   .note { border-left:3px solid var(--warn); padding:8px 12px; background:#1f2736; border-radius:6px; }
   .wrap { overflow-x:auto; }
+  .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; margin:10px 0; }
+  .stat { background:var(--bg); border:1px solid var(--line); border-radius:8px; padding:10px; }
+  .stat b { display:block; font-size:18px; font-weight:600; }
   /* Best pick panel. Green only when the pick passed both tests. */
   .pickbox { display:flex; gap:16px; align-items:center; border:2px solid var(--line); border-radius:12px; padding:14px; background:var(--card); }
   .pickbox.signal { border-color:var(--ok); background:#0f2a22; }
@@ -74,6 +81,53 @@
     </table>
   </div>
 
+  <div class="card">
+    <h2>Results log</h2>
+    <p class="small" style="margin:0 0 12px">Record each demo or paper trade. The log compares your win rate with the fair rate, and your net result with what the payouts predict. It is saved in this browser only.</p>
+    <div class="row">
+      <label>Contract
+        <select id="lType">
+          <option value="M">Matches</option>
+          <option value="D">Differs</option>
+          <option value="O">Over</option>
+          <option value="U">Under</option>
+          <option value="E">Even</option>
+          <option value="A">Odd</option>
+        </select>
+      </label>
+      <label>Digit (0-9)
+        <input id="lDigit" type="number" min="0" max="9" step="1" value="0" style="width:90px">
+      </label>
+      <label>Stake
+        <input id="lStake" type="number" min="0.01" step="0.01" value="1" style="width:100px">
+      </label>
+      <label>Total payout (x stake)
+        <input id="lPay" type="number" min="1.01" step="0.01" value="9" style="width:130px">
+      </label>
+      <label>Result
+        <select id="lRes">
+          <option value="win">Win</option>
+          <option value="loss">Loss</option>
+        </select>
+      </label>
+    </div>
+    <div id="lFair" class="small" style="margin-bottom:10px"></div>
+    <div class="row">
+      <button id="lAdd">Add trade</button>
+      <button id="lUndo" class="alt">Undo last</button>
+      <button id="lClear" class="alt">Clear log</button>
+      <span id="lErr" class="small bad"></span>
+    </div>
+    <div class="stats" id="lStats"></div>
+    <div id="lVerdict" class="small" style="margin:8px 0 12px"></div>
+    <div class="wrap">
+      <table>
+        <thead><tr><th>Time</th><th>Contract</th><th>Stake</th><th>Payout</th><th>Result</th><th>Net</th></tr></thead>
+        <tbody id="lTab"><tr><td colspan="6" class="mute">No trades logged yet.</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
   <div class="card note small">
     <strong>How to read this.</strong> Digits on these indices are generated randomly. A signal here means a
     bet looked better than chance in the sample, after correcting for the number of bets tested.
@@ -116,6 +170,8 @@ const SEL_Z = 3.7;   // selection threshold: about 0.0001 per test across the 20
 const VAL_Z = 1.65;  // holdout must also clear one-sided 5%
 const COUNT = 5000;  // ticks per market (more history gives steadier estimates, not a prediction)
 const STALE_MS = 120000; // after two minutes the scan is marked stale
+const LOG_KEY = "digit-radar-log";
+const MIN_TRADES = 200;  // below this, a win rate cannot be judged
 
 // ---- Statistics -------------------------------------------------------------
 // Contract candidates: Match d, Differ d, Over b, Under b, Even, Odd.
@@ -211,6 +267,7 @@ async function fetchTicks(symbol, pip) {
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s).replace(/[&<>"]/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
 const pct = (x) => (x * 100).toFixed(1) + "%";
+const money = (x) => (x < 0 ? "-" : "") + Math.abs(x).toFixed(2);
 const TYPE_NAMES = { all: "all contract types", match: "Matches", differs: "Differs", evenodd: "Even / Odd", overunder: "Over / Under" };
 let scannedAt = null;
 
@@ -298,7 +355,101 @@ function renderPick(results, family) {
   }
 }
 
+// ---- Results log ------------------------------------------------------------
+// Each trade: contract type t, digit d, stake, total payout multiple pay (incl. stake), win flag.
+function loadLog() {
+  try { const a = JSON.parse(localStorage.getItem(LOG_KEY) || "[]"); return Array.isArray(a) ? a : []; }
+  catch (e) { return []; }
+}
+function saveLog(a) { try { localStorage.setItem(LOG_KEY, JSON.stringify(a)); } catch (e) {} }
+let log = loadLog();
+
+function needsDigit(t) { return t === "M" || t === "D" || t === "O" || t === "U"; }
+function digitRange(t) { return t === "O" ? [0, 8] : t === "U" ? [1, 9] : [0, 9]; }
+
+function updateFair() {
+  const t = $("lType").value;
+  const dIn = $("lDigit");
+  dIn.disabled = !needsDigit(t);
+  const p = fair(t, Number(dIn.value) || 0);
+  $("lFair").textContent = `Fair win rate ${pct(p)}, so a fair total payout is about ${(1 / p).toFixed(2)}x the stake.`;
+}
+
+function addTrade() {
+  const t = $("lType").value;
+  const d = needsDigit(t) ? Number($("lDigit").value) : 0;
+  const stake = Number($("lStake").value);
+  const pay = Number($("lPay").value);
+  const res = $("lRes").value;
+  let err = "";
+  if (needsDigit(t)) {
+    const [lo, hi] = digitRange(t);
+    if (!Number.isInteger(d) || d < lo || d > hi) err = `Digit must be a whole number from ${lo} to ${hi} for this contract.`;
+  }
+  if (!err && !(stake > 0)) err = "Stake must be more than 0.";
+  if (!err && !(pay > 1)) err = "Total payout must be more than 1x the stake.";
+  $("lErr").textContent = err;
+  if (err) return;
+  log.push({ t, d, stake, pay, win: res === "win", at: Date.now() });
+  saveLog(log);
+  renderLog();
+}
+
+function tradeNet(x) { return x.win ? x.stake * (x.pay - 1) : -x.stake; }
+
+function renderLog() {
+  const n = log.length;
+  // Expected numbers from the fair odds and the payouts actually entered.
+  let sumP = 0, sumVar = 0, wins = 0, net = 0, expNet = 0;
+  for (const x of log) {
+    const p = fair(x.t, x.d);
+    sumP += p; sumVar += p * (1 - p);
+    if (x.win) wins++;
+    net += tradeNet(x);
+    expNet += x.stake * (p * x.pay - 1);
+  }
+  const zWin = n ? (wins - sumP) / Math.sqrt(sumVar) : 0;
+  const stats = n ? [
+    ["Trades", String(n)],
+    ["Win rate", pct(wins / n) + " (fair " + pct(sumP / n) + ")"],
+    ["Net result", money(net)],
+    ["Expected from payouts", money(expNet)],
+    ["Luck check (z)", zWin.toFixed(2)]
+  ] : [["Trades", "0"]];
+  $("lStats").innerHTML = stats.map(s => `<div class="stat"><span class="small">${esc(s[0])}</span><b>${esc(s[1])}</b></div>`).join("");
+
+  let verdict;
+  if (n === 0) verdict = "Log a trade to start.";
+  else if (n < MIN_TRADES) verdict = `Too few trades to judge yet. Log at least ${MIN_TRADES}; you have ${n}.`;
+  else if (zWin >= 1.65) verdict = "Win rate is above the fair rate by more than normal luck.";
+  else if (zWin <= -1.65) verdict = "Win rate is below the fair rate by more than normal luck.";
+  else verdict = "Win rate is within normal luck of the fair rate.";
+  if (n > 0) {
+    const perTrade = expNet / n;
+    if (perTrade < 0) verdict += ` The payouts you entered are below fair odds: each trade is expected to lose about ${money(-perTrade)} on average.`;
+  }
+  $("lVerdict").textContent = verdict;
+
+  if (!n) {
+    $("lTab").innerHTML = `<tr><td colspan="6" class="mute">No trades logged yet.</td></tr>`;
+    return;
+  }
+  $("lTab").innerHTML = log.slice().reverse().slice(0, 50).map(x => {
+    const time = new Date(x.at).toLocaleString();
+    const contract = esc(label(x.t, x.d));
+    const cls = x.win ? "ok" : "bad";
+    return `<tr><td>${esc(time)}</td><td>${contract}</td><td>${money(x.stake)}</td><td>${x.pay.toFixed(2)}x</td><td class="${cls}">${x.win ? "Win" : "Loss"}</td><td class="${cls}">${money(tradeNet(x))}</td></tr>`;
+  }).join("");
+}
+
+$("lType").addEventListener("change", updateFair);
+$("lDigit").addEventListener("input", updateFair);
+$("lAdd").addEventListener("click", addTrade);
+$("lUndo").addEventListener("click", () => { log.pop(); saveLog(log); renderLog(); });
+$("lClear").addEventListener("click", () => { if (confirm("Clear the whole results log?")) { log = []; saveLog(log); renderLog(); } });
 $("scanBtn").addEventListener("click", scan);
+updateFair();
+renderLog();
 </script>
 </body>
 </html>
