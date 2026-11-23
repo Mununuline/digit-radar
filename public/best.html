@@ -15,7 +15,6 @@
   button { background:#3b82f6; color:#fff; border:0; border-radius:8px; padding:10px 16px; font-size:15px; cursor:pointer; }
   button:disabled { background:#334; cursor:not-allowed; }
   select { background:var(--bg); color:var(--ink); border:1px solid var(--line); border-radius:8px; padding:9px 10px; font-size:15px; margin-right:10px; }
-  .pick { font-size:20px; font-weight:600; margin:2px 0 6px; }
   .ok { color:var(--ok); } .warn { color:var(--warn); } .bad { color:var(--bad); } .mute { color:var(--mute); }
   table { width:100%; border-collapse:collapse; font-size:14px; }
   th, td { text-align:left; padding:8px 6px; border-bottom:1px solid var(--line); }
@@ -23,12 +22,20 @@
   .small { font-size:13px; color:var(--mute); }
   .note { border-left:3px solid var(--warn); padding:8px 12px; background:#1f2736; border-radius:6px; }
   .wrap { overflow-x:auto; }
+  /* Best pick panel. Green only when the pick passed both tests. */
+  .pickbox { display:flex; gap:16px; align-items:center; border:2px solid var(--line); border-radius:12px; padding:14px; background:var(--card); }
+  .pickbox.signal { border-color:var(--ok); background:#0f2a22; }
+  .digit { font-size:64px; font-weight:800; line-height:1; min-width:96px; text-align:center; padding:10px 0; border-radius:10px; background:var(--bg); color:var(--mute); font-variant-numeric:tabular-nums; }
+  .pickbox.signal .digit { background:var(--ok); color:#06261b; }
+  .pick-text { font-size:18px; font-weight:600; }
+  .pickbox.signal .pick-text { color:var(--ok); }
+  .age { font-variant-numeric:tabular-nums; }
 </style>
 </head>
 <body>
 <main>
   <h1>Best Market & Digit Scanner</h1>
-  <p class="sub">Scans all 10 volatility indices in one pass and picks one market and one digit. It is marked as a signal only when it survives a multiple-comparison correction and an out-of-sample check.</p>
+  <p class="sub">Scans all 10 volatility indices in one pass and picks one market and one digit. The pick turns green only when it passes both the selection and the holdout test.</p>
 
   <div class="card">
     <label for="type" class="small" style="display:block;margin-bottom:6px">Contract type to scan</label>
@@ -41,13 +48,19 @@
     </select>
     <button id="scanBtn">Scan all markets</button>
     <div id="status" class="small" style="margin-top:10px"></div>
+    <div id="age" class="small age" style="margin-top:4px"></div>
   </div>
 
-  <div class="card" id="verdictCard">
+  <div class="card">
     <div class="small">Best pick</div>
-    <div id="pick" class="pick mute">Press "Scan all markets" to start.</div>
-    <div id="verdict" class="verdict mute"></div>
-    <div id="detail" class="small" style="margin-top:6px"></div>
+    <div id="pickbox" class="pickbox" style="margin-top:8px">
+      <div id="digit" class="digit">-</div>
+      <div style="min-width:0">
+        <div id="pick" class="pick-text mute">Press "Scan all markets" to start.</div>
+        <div id="verdict" class="small" style="margin-top:4px"></div>
+        <div id="detail" class="small" style="margin-top:6px"></div>
+      </div>
+    </div>
   </div>
 
   <div class="card wrap">
@@ -62,8 +75,8 @@
     bet looked better than chance in the sample, after correcting for the number of bets tested.
     Under pure randomness, a false signal appears in roughly 0.2% of scans. Even a real pattern can stop
     working without warning. Nothing on this page predicts a result, and it does not guarantee a win.
-    Deriv pays less than fair odds on these contracts, so random digits lose money over time.
-    Use the demo account and risk only money you can afford to lose.
+    No timing window or deeper history makes a digit more predictable. Deriv pays less than fair odds on
+    these contracts, so random digits lose money over time. Use the demo account and risk only money you can afford to lose.
   </div>
 </main>
 
@@ -97,7 +110,8 @@ const FAMILIES = {
 };
 const SEL_Z = 3.7;   // selection threshold: about 0.0001 per test across the 20 candidates
 const VAL_Z = 1.65;  // holdout must also clear one-sided 5%
-const COUNT = 1000;  // ticks per market
+const COUNT = 5000;  // ticks per market (more history gives steadier estimates, not a prediction)
+const STALE_MS = 120000; // after two minutes the scan is marked stale
 
 // ---- Statistics -------------------------------------------------------------
 // Contract candidates: Match d, Differ d, Over b, Under b, Even, Odd.
@@ -162,7 +176,7 @@ function requestTicks(url, symbol, pip) {
   return new Promise((resolve, reject) => {
     let ws, done = false;
     const finish = (fn, v) => { if (done) return; done = true; clearTimeout(timer); try { ws.close(); } catch (_) {} fn(v); };
-    const timer = setTimeout(() => finish(reject, new Error("no reply")), 8000);
+    const timer = setTimeout(() => finish(reject, new Error("no reply")), 15000);
     try { ws = new WebSocket(url); } catch (e) { finish(reject, e); return; }
     ws.onopen = () => ws.send(JSON.stringify({ ticks_history: symbol, count: COUNT, end: "latest", style: "ticks", req_id: 1 }));
     ws.onmessage = (ev) => {
@@ -194,6 +208,7 @@ const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s).replace(/[&<>"]/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
 const pct = (x) => (x * 100).toFixed(1) + "%";
 const TYPE_NAMES = { all: "all contract types", match: "Matches", differs: "Differs", evenodd: "Even / Odd", overunder: "Over / Under" };
+let scannedAt = null;
 
 async function scan() {
   const btn = $("scanBtn");
@@ -211,10 +226,23 @@ async function scan() {
     }
     renderRows(results);
   }
-  $("status").textContent = "Scan finished at " + new Date().toLocaleTimeString() + " (" + TYPE_NAMES[family] + ")";
+  scannedAt = Date.now();
+  $("status").textContent = "Scan finished at " + new Date(scannedAt).toLocaleTimeString() + " (" + TYPE_NAMES[family] + ")";
   renderPick(results, family);
+  tickAge();
   btn.disabled = false;
 }
+
+// Shows how long ago the last scan finished. It does not mark any time as "good to trade".
+function tickAge() {
+  if (!scannedAt) { $("age").textContent = ""; return; }
+  const s = Math.floor((Date.now() - scannedAt) / 1000);
+  const mm = String(Math.floor(s / 60)).padStart(2, "0"), ss = String(s % 60).padStart(2, "0");
+  const stale = Date.now() - scannedAt > STALE_MS;
+  $("age").className = "small age " + (stale ? "warn" : "");
+  $("age").textContent = "Time since scan: " + mm + ":" + ss + (stale ? " - stale, scan again before relying on this" : "");
+}
+setInterval(tickAge, 1000);
 
 function renderRows(results) {
   $("rows").innerHTML = results.map(r => {
@@ -225,11 +253,15 @@ function renderRows(results) {
   }).join("");
 }
 
-// One pick: the market and digit with the strongest holdout result, whether or not it passes.
+// One pick: the market and digit with the strongest holdout result.
+// Green only when it passed both tests.
 function renderPick(results, family) {
   const ok = results.filter(r => !r.error);
+  const box = $("pickbox");
+  box.className = "pickbox";
   if (ok.length === 0) {
-    $("pick").className = "pick bad";
+    $("digit").textContent = "-";
+    $("pick").className = "pick-text bad";
     $("pick").textContent = "No market data could be loaded.";
     $("verdict").textContent = "";
     $("detail").textContent = "Deriv did not answer from either feed. Check your connection, or try the main dashboard first to confirm the feed is up.";
@@ -237,16 +269,18 @@ function renderPick(results, family) {
   }
   const top = ok.slice().sort((a, b) => b.zVal - a.zVal)[0];
   const name = NAMES[top.sym] || top.sym;
-  $("pick").className = "pick";
+  $("digit").textContent = top.d;
+  $("pick").className = "pick-text";
   $("pick").textContent = `${name}: ${top.label}`;
   if (top.pass) {
-    $("verdict").className = "verdict ok";
+    box.className = "pickbox signal";
+    $("verdict").className = "small ok";
     $("verdict").textContent = "Signal: passed both tests.";
     $("detail").textContent = `Holdout win rate ${pct(top.winRate)} against a fair rate of ${pct(top.fairRate)} (holdout z = ${top.zVal.toFixed(2)}). Treat this as a statistical observation, not a prediction.`;
   } else {
-    $("verdict").className = "verdict warn";
+    $("verdict").className = "small warn";
     $("verdict").textContent = "No edge shown. Do not trade on this pick.";
-    $("detail").textContent = `This is the strongest of ${ok.length} markets for ${TYPE_NAMES[family]}, and it did not pass both tests (holdout z = ${top.zVal.toFixed(2)}). With random digits, one market always looks best by chance.`;
+    $("detail").textContent = `Strongest of ${ok.length} markets for ${TYPE_NAMES[family]}. It did not pass both tests (holdout z = ${top.zVal.toFixed(2)}). With random digits, one market always looks best by chance.`;
   }
 }
 
