@@ -74,6 +74,20 @@
     </div>
   </div>
 
+  <div class="card">
+    <h2>Trade ticket</h2>
+    <p class="small" style="margin:0 0 10px">Prepares the pick for a manual trade. Nothing is placed automatically. You place the trade yourself in the Trade tab of the main dashboard.</p>
+    <div class="row">
+      <label>Stake
+        <input id="tkStake" type="number" min="0.35" max="10" step="0.01" value="1" style="width:110px">
+      </label>
+      <button id="tkBtn">Prepare ticket</button>
+    </div>
+    <div id="tkStreak" class="small" style="margin-bottom:8px"></div>
+    <div id="tkOut" class="small"></div>
+    <p class="small" style="margin-top:10px"><a href="/#trade" style="color:#93a0b5">Open the Trade tab on the main dashboard &rarr;</a></p>
+  </div>
+
   <div class="card wrap">
     <table>
       <thead><tr><th>Market</th><th>Best digit bet</th><th>Select z</th><th>Holdout z</th><th>Holdout win rate</th><th>Fair rate</th><th>Result</th></tr></thead>
@@ -290,6 +304,7 @@ async function scan() {
   scannedAt = Date.now();
   $("status").textContent = "Scan finished at " + new Date(scannedAt).toLocaleTimeString() + " (" + TYPE_NAMES[family] + ")";
   renderPick(results, family);
+  updateTicket();
   flashFresh();
   tickAge();
   btn.disabled = false;
@@ -331,6 +346,7 @@ function renderPick(results, family) {
   const box = $("pickbox");
   box.className = "pickbox";
   if (ok.length === 0) {
+    lastPick = null;
     $("digit").textContent = "-";
     $("pick").className = "pick-text bad";
     $("pick").textContent = "No market data could be loaded.";
@@ -339,6 +355,7 @@ function renderPick(results, family) {
     return;
   }
   const top = ok.slice().sort((a, b) => b.zVal - a.zVal)[0];
+  lastPick = top;
   const name = NAMES[top.sym] || top.sym;
   $("digit").textContent = top.d;
   $("pick").className = "pick-text";
@@ -429,7 +446,7 @@ function renderLog() {
     if (perTrade < 0) verdict += ` The payouts you entered are below fair odds: each trade is expected to lose about ${money(-perTrade)} on average.`;
   }
   $("lVerdict").textContent = verdict;
-
+  updateTicket();
   if (!n) {
     $("lTab").innerHTML = `<tr><td colspan="6" class="mute">No trades logged yet.</td></tr>`;
     return;
@@ -442,12 +459,42 @@ function renderLog() {
   }).join("");
 }
 
+// ---- Trade ticket ----------------------------------------------------------
+// Prepares a manual trade only. Nothing is placed from this page.
+const MAX_LOSS_STREAK = 3;
+let lastPick = null;
+function lossStreak() {
+  let n = 0;
+  for (let i = log.length - 1; i >= 0 && !log[i].win; i--) n++;
+  return n;
+}
+function updateTicket() {
+  const streak = lossStreak();
+  const locked = streak >= MAX_LOSS_STREAK;
+  const ready = !!(lastPick && lastPick.pass);
+  $("tkStreak").className = "small" + (locked ? " bad" : "");
+  $("tkStreak").textContent = locked
+    ? `Stopped: ${streak} losing trades in a row. Record a win or clear the log before preparing another ticket.`
+    : `Losing streak: ${streak} of ${MAX_LOSS_STREAK} allowed.`;
+  $("tkBtn").disabled = locked || !ready;
+  if (!lastPick) $("tkOut").textContent = "Scan first.";
+  else if (!ready) $("tkOut").textContent = "This pick has no edge, so no ticket can be prepared.";
+  else if (locked) $("tkOut").textContent = "";
+}
+function prepareTicket() {
+  const stake = Number($("tkStake").value);
+  if (!(stake > 0) || stake > 10) { $("tkOut").textContent = "Stake must be more than 0 and no more than 10."; return; }
+  if (!lastPick || !lastPick.pass || lossStreak() >= MAX_LOSS_STREAK) return;
+  $("tkOut").innerHTML = `Ticket ready: <b>${esc(NAMES[lastPick.sym] || lastPick.sym)}</b>, <b>${esc(lastPick.label)}</b>, stake <b>${money(stake)}</b>. Place it yourself in the Trade tab, then record the result in the results log.`;
+}
+
 $("lType").addEventListener("change", updateFair);
 $("lDigit").addEventListener("input", updateFair);
 $("lAdd").addEventListener("click", addTrade);
 $("lUndo").addEventListener("click", () => { log.pop(); saveLog(log); renderLog(); });
 $("lClear").addEventListener("click", () => { if (confirm("Clear the whole results log?")) { log = []; saveLog(log); renderLog(); } });
 $("scanBtn").addEventListener("click", scan);
+$("tkBtn").addEventListener("click", prepareTicket);
 updateFair();
 renderLog();
 </script>
