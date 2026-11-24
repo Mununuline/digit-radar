@@ -85,6 +85,14 @@
     </div>
     <div id="tkStreak" class="small" style="margin-bottom:8px"></div>
     <div id="tkOut" class="small"></div>
+    <div class="row" style="margin-top:10px">
+      <label>Trading password
+        <input id="tkPass" type="password" autocomplete="current-password" style="width:200px">
+      </label>
+      <button id="tkPlace" disabled>Place demo trade</button>
+    </div>
+    <div id="tkPlaceOut" class="small"></div>
+    <p class="small" style="margin:6px 0 0">Demo account only. Each trade asks you to confirm and is placed once per prepared ticket.</p>
     <p class="small" style="margin-top:10px"><a href="/#trade" style="color:#93a0b5">Open the Trade tab on the main dashboard &rarr;</a></p>
   </div>
 
@@ -289,6 +297,7 @@ async function scan() {
   const btn = $("scanBtn");
   const family = $("type").value;
   const types = FAMILIES[family] || FAMILIES.all;
+  readyTicket = null;
   btn.disabled = true;
   $("status").textContent = "Fetching ticks…";
   const results = [];
@@ -446,6 +455,7 @@ function renderLog() {
     if (perTrade < 0) verdict += ` The payouts you entered are below fair odds: each trade is expected to lose about ${money(-perTrade)} on average.`;
   }
   $("lVerdict").textContent = verdict;
+
   updateTicket();
   if (!n) {
     $("lTab").innerHTML = `<tr><td colspan="6" class="mute">No trades logged yet.</td></tr>`;
@@ -463,6 +473,7 @@ function renderLog() {
 // Prepares a manual trade only. Nothing is placed from this page.
 const MAX_LOSS_STREAK = 3;
 let lastPick = null;
+let readyTicket = null; // set only by Prepare ticket, cleared after each scan and after each trade
 function lossStreak() {
   let n = 0;
   for (let i = log.length - 1; i >= 0 && !log[i].win; i--) n++;
@@ -476,7 +487,9 @@ function updateTicket() {
   $("tkStreak").textContent = locked
     ? `Stopped: ${streak} losing trades in a row. Record a win or clear the log before preparing another ticket.`
     : `Losing streak: ${streak} of ${MAX_LOSS_STREAK} allowed.`;
+  if (locked || !ready) readyTicket = null;
   $("tkBtn").disabled = locked || !ready;
+  $("tkPlace").disabled = !readyTicket;
   if (!lastPick) $("tkOut").textContent = "Scan first.";
   else if (!ready) $("tkOut").textContent = "This pick has no edge, so no ticket can be prepared.";
   else if (locked) $("tkOut").textContent = "";
@@ -485,7 +498,67 @@ function prepareTicket() {
   const stake = Number($("tkStake").value);
   if (!(stake > 0) || stake > 10) { $("tkOut").textContent = "Stake must be more than 0 and no more than 10."; return; }
   if (!lastPick || !lastPick.pass || lossStreak() >= MAX_LOSS_STREAK) return;
-  $("tkOut").innerHTML = `Ticket ready: <b>${esc(NAMES[lastPick.sym] || lastPick.sym)}</b>, <b>${esc(lastPick.label)}</b>, stake <b>${money(stake)}</b>. Place it yourself in the Trade tab, then record the result in the results log.`;
+  $("tkOut").innerHTML = `Ticket ready: <b>${esc(NAMES[lastPick.sym] || lastPick.sym)}</b>, <b>${esc(lastPick.label)}</b>, stake <b>${money(stake)}</b>. Place it yourself in the Trade tab, or press Place demo trade. Then record the result in the results log.`;
+  readyTicket = { sym: lastPick.sym, t: lastPick.t, d: lastPick.d, label: lastPick.label, stake };
+  $("tkPlace").disabled = false;
+}
+
+// Demo placement. Runs only on a button press, for one prepared ticket at a time.
+const CONTRACT_CODE = { M: "DIGITMATCH", D: "DIGITDIFF", O: "DIGITOVER", U: "DIGITUNDER", E: "DIGITEVEN", A: "DIGITODD" };
+const TRADE_CURRENCY = "USD"; // must match the demo account's currency; Deriv refuses the trade otherwise
+
+function derivBuy(url, tk) {
+  return new Promise((resolve, reject) => {
+    let ws, done = false, bought = false;
+    const finish = (fn, v) => { if (done) return; done = true; clearTimeout(timer); try { ws.close(); } catch (_) {} fn(v); };
+    const timer = setTimeout(() => finish(reject, new Error("Deriv did not answer in time.")), 20000);
+    try { ws = new WebSocket(url); } catch (e) { finish(reject, e); return; }
+    const req = { proposal: 1, amount: tk.stake, basis: "stake", contract_type: CONTRACT_CODE[tk.t], currency: TRADE_CURRENCY, duration: 1, duration_unit: "t", symbol: tk.sym };
+    if (tk.t === "M" || tk.t === "D" || tk.t === "O" || tk.t === "U") req.barrier = String(tk.d);
+    ws.onopen = () => ws.send(JSON.stringify(req));
+    ws.onmessage = (ev) => {
+      let m; try { m = JSON.parse(ev.data); } catch (_) { return; }
+      if (m.error) { finish(reject, new Error(m.error.message || m.error.code || "Deriv refused the trade.")); return; }
+      if (m.msg_type === "proposal" && m.proposal && !bought) {
+        bought = true;
+        ws.send(JSON.stringify({ buy: m.proposal.id, price: m.proposal.ask_price }));
+      } else if (m.msg_type === "buy" && m.buy) {
+        finish(resolve, { contract: m.buy.contract_id, price: Number(m.buy.buy_price) });
+      }
+    };
+    ws.onerror = () => finish(reject, new Error("connection failed"));
+    ws.onclose = () => finish(reject, new Error("connection closed before Deriv confirmed the trade"));
+  });
+}
+
+async function placeDemoTrade() {
+  const tk = readyTicket;
+  if (!tk || lossStreak() >= MAX_LOSS_STREAK) return;
+  const out = (msg, cls) => { $("tkPlaceOut").className = "small " + (cls || ""); $("tkPlaceOut").textContent = msg; };
+  const pass = $("tkPass").value;
+  if (!pass) { out("Enter your trading password first.", "bad"); return; }
+  if (!confirm(`Place a DEMO trade: ${NAMES[tk.sym] || tk.sym}, ${tk.label}, stake ${money(tk.stake)}?`)) return;
+  readyTicket = null;
+  $("tkPlace").disabled = true;
+  out("Connecting to the demo account...");
+  let url;
+  try {
+    const r = await fetch("/api/deriv/otp", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-app-password": pass },
+      body: JSON.stringify({ mode: "demo" })
+    });
+    const b = await r.json().catch(() => ({}));
+    if (!r.ok || !b.url) { out(b.error || "Could not connect to the demo account.", "bad"); updateTicket(); return; }
+    url = b.url;
+  } catch (e) { out("Could not reach the server.", "bad"); updateTicket(); return; }
+  try {
+    const res = await derivBuy(url, tk);
+    out(`Demo trade placed. Contract ${res.contract}, price ${money(res.price)}. Record the outcome in the results log when it settles.`, "ok");
+  } catch (e) {
+    out("Trade not placed: " + e.message, "bad");
+  }
+  updateTicket();
 }
 
 $("lType").addEventListener("change", updateFair);
@@ -495,6 +568,7 @@ $("lUndo").addEventListener("click", () => { log.pop(); saveLog(log); renderLog(
 $("lClear").addEventListener("click", () => { if (confirm("Clear the whole results log?")) { log = []; saveLog(log); renderLog(); } });
 $("scanBtn").addEventListener("click", scan);
 $("tkBtn").addEventListener("click", prepareTicket);
+$("tkPlace").addEventListener("click", placeDemoTrade);
 updateFair();
 renderLog();
 </script>
