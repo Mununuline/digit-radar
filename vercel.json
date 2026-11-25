@@ -1,9 +1,10 @@
 {
   "functions": {
-    "api/app.js": { "maxDuration": 30, "includeFiles": "public/**" }
+    "api/[...path].js": { "maxDuration": 30, "includeFiles": "public/**" }
   },
   "rewrites": [
-    { "source": "/(.*)", "destination": "/api/app?__p=$1" }
+    { "source": "/", "destination": "/api/index.html" },
+    { "source": "/(.*)", "destination": "/api/$1" }
   ],
   "headers": [
     {
