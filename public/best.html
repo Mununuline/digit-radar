@@ -150,6 +150,22 @@
     </div>
   </div>
 
+  <div class="card">
+    <h2>Forward test</h2>
+    <p class="small" style="margin:0 0 10px">Each scan's top pick is recorded before any new ticks arrive, then scored on the next tick from that market. Picks with no edge count too. Nothing is traded. While this page stays open, a scan runs every minute. The test stops if you close or reload the page.</p>
+    <div class="row">
+      <label>Picks to test (50 to 1000)
+        <input id="fwN" type="number" min="50" max="1000" step="10" value="200" style="width:150px">
+      </label>
+      <button id="fwStart">Start forward test</button>
+      <button id="fwStop" class="alt" disabled>Stop</button>
+      <button id="fwClear" class="alt">Clear records</button>
+    </div>
+    <div id="fwStatus" class="small"></div>
+    <div class="stats" id="fwStats"></div>
+    <div id="fwVerdict" class="small" style="margin-top:8px"></div>
+  </div>
+
   <div class="card note small">
     <strong>How to read this.</strong> Digits on these indices are generated randomly. A signal here means a
     bet looked better than chance in the sample, after correcting for the number of bets tested.
@@ -313,6 +329,7 @@ async function scan() {
   scannedAt = Date.now();
   $("status").textContent = "Scan finished at " + new Date(scannedAt).toLocaleTimeString() + " (" + TYPE_NAMES[family] + ")";
   renderPick(results, family);
+  fwRecord(lastPick);
   updateTicket();
   flashFresh();
   tickAge();
@@ -561,6 +578,134 @@ async function placeDemoTrade() {
   updateTicket();
 }
 
+// ---- Forward test ----------------------------------------------------------
+// Records the top pick of each scan before any new tick arrives, then scores it on the
+// next tick from that market. Nothing is traded. The sample size is fixed when you start.
+const FW_KEY = "digit-radar-forward";
+const FW_AUTO_MS = 60000;
+let fwAutoTimer = null, fwWs = null, fwReconnect = null;
+function loadFw() {
+  try {
+    const o = JSON.parse(localStorage.getItem(FW_KEY) || "null");
+    if (o && Array.isArray(o.picks) && o.n) return o;
+  } catch (e) { /* unreadable, start fresh */ }
+  return { n: 200, active: false, picks: [] };
+}
+function saveFw() { try { localStorage.setItem(FW_KEY, JSON.stringify(fw)); } catch (e) {} }
+let fw = loadFw();
+function fwNeedsFeed() { return fw.active || fw.picks.some(p => p.res === null); }
+
+function fwRecord(pick) {
+  if (!fw.active || !pick || fw.picks.length >= fw.n) return;
+  fw.picks.push({ sym: pick.sym, t: pick.t, d: pick.d, p: fair(pick.t, pick.d), at: Date.now(), res: null });
+  if (fw.picks.length >= fw.n) { fw.active = false; stopAuto(); fwSetButtons(); }
+  saveFw();
+  if (fwNeedsFeed() && !fwWs) fwConnect();
+  fwRender();
+}
+
+// A tick is the outcome for every pick still waiting on that market.
+function fwTick(tk) {
+  if (!fwNeedsFeed()) return;
+  const mk = MARKETS.find(m => m[0] === tk.symbol);
+  if (!mk) return;
+  const pip = typeof tk.pip_size === "number" ? tk.pip_size : mk[1];
+  const s = Number(tk.quote).toFixed(pip);
+  const x = +s.charAt(s.length - 1);
+  let changed = false;
+  for (const p of fw.picks) {
+    if (p.res === null && p.sym === tk.symbol) { p.res = wins(p.t, p.d, x) ? 1 : 0; changed = true; }
+  }
+  if (changed) { saveFw(); fwRender(); }
+  fwCloseIfDone();
+}
+
+function fwCloseIfDone() {
+  if (fwNeedsFeed()) return;
+  clearTimeout(fwReconnect); fwReconnect = null;
+  if (fwWs) { const w = fwWs; fwWs = null; try { w.close(); } catch (e) {} }
+}
+
+// One tick connection for all markets. Tries each feed in turn and reconnects while needed.
+function fwConnect() {
+  if (!fwNeedsFeed() || fwWs) return;
+  let idx = 0;
+  const attempt = () => {
+    if (!fwNeedsFeed() || fwWs) return;
+    if (idx >= FEEDS.length) { fwReconnect = setTimeout(fwConnect, 5000); return; }
+    let ws, opened = false;
+    try { ws = new WebSocket(FEEDS[idx]); } catch (e) { idx++; attempt(); return; }
+    fwWs = ws;
+    ws.onopen = () => {
+      opened = true;
+      MARKETS.forEach(m => ws.send(JSON.stringify({ ticks: m[0], subscribe: 1 })));
+    };
+    ws.onmessage = (ev) => {
+      let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
+      if (m.msg_type === "tick" && m.tick) fwTick(m.tick);
+    };
+    ws.onerror = () => {};
+    ws.onclose = () => {
+      if (fwWs === ws) fwWs = null;
+      if (!fwNeedsFeed()) return;
+      if (opened) fwReconnect = setTimeout(fwConnect, 3000);
+      else { idx++; attempt(); }
+    };
+  };
+  attempt();
+}
+
+function startAuto() {
+  stopAuto();
+  fwAutoTimer = setInterval(() => { if (fw.active && !$("scanBtn").disabled) scan(); }, FW_AUTO_MS);
+}
+function stopAuto() { if (fwAutoTimer) { clearInterval(fwAutoTimer); fwAutoTimer = null; } }
+function fwSetButtons() { $("fwStart").disabled = fw.active; $("fwStop").disabled = !fw.active; }
+
+function fwStart() {
+  const n = Math.round(Number($("fwN").value));
+  if (!(n >= 50 && n <= 1000)) { $("fwStatus").textContent = "Choose a sample size from 50 to 1000."; return; }
+  if (fw.picks.length && !confirm("Start a new forward test? The current records will be cleared.")) return;
+  fw = { n, active: true, picks: [] };
+  saveFw(); fwConnect(); startAuto(); fwSetButtons(); fwRender();
+  if (!$("scanBtn").disabled) scan();
+}
+function fwStop() {
+  fw.active = false; stopAuto(); saveFw(); fwCloseIfDone(); fwSetButtons(); fwRender();
+}
+function fwClear() {
+  if (!confirm("Clear the forward test records?")) return;
+  fw = { n: fw.n, active: false, picks: [] };
+  stopAuto(); saveFw(); fwCloseIfDone(); fwSetButtons(); fwRender();
+}
+
+function fwRender() {
+  const total = fw.picks.length;
+  const done = fw.picks.filter(p => p.res !== null);
+  const n = done.length;
+  const won = done.reduce((a, p) => a + p.res, 0);
+  const sumP = done.reduce((a, p) => a + p.p, 0);
+  const sumVar = done.reduce((a, p) => a + p.p * (1 - p.p), 0);
+  const zz = n ? (won - sumP) / Math.sqrt(sumVar) : 0;
+  $("fwStatus").textContent = `Picks recorded: ${total} of ${fw.n}. Resolved on the next tick: ${n}. ` +
+    (fw.active ? "Running: a scan runs every minute." : "Not running.");
+  const stats = n ? [
+    ["Resolved", String(n)],
+    ["Win rate", pct(won / n) + " (fair " + pct(sumP / n) + ")"],
+    ["Luck check (z)", zz.toFixed(2)]
+  ] : [["Resolved", "0"]];
+  $("fwStats").innerHTML = stats.map(s => `<div class="stat"><span class="small">${esc(s[0])}</span><b>${esc(s[1])}</b></div>`).join("");
+  let v;
+  if (total < fw.n) {
+    v = fw.active ? `Still collecting. The verdict appears after ${fw.n} picks are recorded and resolved.`
+      : "Stopped before the sample was complete, so there is no verdict.";
+  } else if (n < total) v = "Waiting for the last picks to resolve on the next tick.";
+  else if (zz >= 1.65) v = "Win rate is above the fair rate by more than normal luck. This is one sample: repeat the test on a fresh run before trusting it.";
+  else if (zz <= -1.65) v = "Win rate is below the fair rate by more than normal luck.";
+  else v = "Win rate is within normal luck of the fair rate. No edge shown.";
+  $("fwVerdict").textContent = v;
+}
+
 $("lType").addEventListener("change", updateFair);
 $("lDigit").addEventListener("input", updateFair);
 $("lAdd").addEventListener("click", addTrade);
@@ -569,6 +714,15 @@ $("lClear").addEventListener("click", () => { if (confirm("Clear the whole resul
 $("scanBtn").addEventListener("click", scan);
 $("tkBtn").addEventListener("click", prepareTicket);
 $("tkPlace").addEventListener("click", placeDemoTrade);
+$("fwStart").addEventListener("click", fwStart);
+$("fwStop").addEventListener("click", fwStop);
+$("fwClear").addEventListener("click", fwClear);
+// A page reload stops the scan timer, so a test that was running is stopped. Picks still waiting are resolved.
+fw.active = false;
+saveFw();
+fwSetButtons();
+fwRender();
+fwConnect();
 updateFair();
 renderLog();
 </script>
